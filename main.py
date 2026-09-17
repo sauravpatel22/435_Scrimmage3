@@ -5,7 +5,9 @@ Command-line entry point that ties the other modules together into the
 guided workflow described in the Scrimmage 2 plan and mocked up in
 scrimmage2_workflow.pptx: point at a folder of .xlsx files, pick one or
 more series to track, pick how to order observations, extract + validate
-the data, pick a chart type, and write the graph/CSV/report to disk.
+the data, pick a chart type, and write the graph to disk. The only output
+file is a single PNG chart; any warnings from the run are printed to the
+console instead of being written to disk.
 
 This module is split into two layers on purpose:
   - run_pipeline(config): pure orchestration, no user interaction. Given a
@@ -23,29 +25,27 @@ from __future__ import annotations
 
 import argparse
 import sys
-import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
+
+import openpyxl
 
 from models import ChartType, OrderingMethod, RunConfig, Selector
-from spreadsheet_processor import discover_files, export_reports, extract_dataset
-from visualizer import create_charts
+from spreadsheet_processor import discover_files, extract_dataset
+from visualizer import create_chart
 
 _ORDERING_MENU = {
-    "1": OrderingMethod.DATE_IN_SHEET,
-    "2": OrderingMethod.DATE_IN_FILENAME,
-    "3": OrderingMethod.FILE_CREATION_DATE,
-    "4": OrderingMethod.FILENAME,
-    "5": OrderingMethod.CUSTOM,
+    "1": OrderingMethod.FILENAME,
+    "2": OrderingMethod.FILE_CREATION_DATE,
+    "3": OrderingMethod.CUSTOM,
 }
 
 _CHART_MENU = {
     "1": ChartType.LINE,
     "2": ChartType.SCATTER,
     "3": ChartType.BAR,
-    "4": ChartType.AUTO,
 }
 
 
@@ -57,9 +57,8 @@ class RunOutputs:
     run_id: str
     files_processed: int
     observation_count: int
-    warning_count: int
-    chart_paths: Dict[str, Path]
-    report_paths: Dict[str, Path]
+    warnings: List[str]
+    chart_path: Path
 
 
 # ---------------------------------------------------------------------------
@@ -68,16 +67,17 @@ class RunOutputs:
 
 def run_pipeline(config: RunConfig) -> RunOutputs:
     """
-    Execute one full run for an already-built RunConfig: extract data,
-    generate charts, and export reports. Contains no input()/print() calls
-    so it can be exercised directly by tests or by other tools, and reused
-    unchanged whether config was built interactively or from CLI flags.
+    Execute one full run for an already-built RunConfig: extract data and
+    generate the chart. Contains no input()/print() calls so it can be
+    exercised directly by tests or by other tools, and reused unchanged
+    whether config was built interactively or from CLI flags. Warnings are
+    returned as plain strings for the caller to print or otherwise handle,
+    rather than being written to a file here.
     """
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     result = extract_dataset(config)
-    chart_paths = create_charts(result, config, run_id)
-    report_paths = export_reports(result, config, run_id)
+    chart_path = create_chart(result, config, run_id)
 
     files_processed = len({obs.source_file for obs in result.observations})
 
@@ -85,9 +85,8 @@ def run_pipeline(config: RunConfig) -> RunOutputs:
         run_id=run_id,
         files_processed=files_processed,
         observation_count=len(result.observations),
-        warning_count=len(result.warnings),
-        chart_paths=chart_paths,
-        report_paths=report_paths,
+        warnings=[str(warning) for warning in result.warnings],
+        chart_path=chart_path,
     )
 
 
@@ -103,8 +102,6 @@ def _detect_candidate_labels(input_folder: Path, sample_size: int = 5) -> List[s
     blocks the user from typing a label that wasn't detected, since a
     label might legitimately appear only in some files.
     """
-    import openpyxl  # local import: only needed for this preview helper
-
     labels: List[str] = []
     seen = set()
 
@@ -135,11 +132,9 @@ def _detect_candidate_labels(input_folder: Path, sample_size: int = 5) -> List[s
 
 def _prompt_ordering(files: List[Path]) -> tuple[OrderingMethod, Optional[List[str]]]:
     print("How should observations be ordered?")
-    print("  1. Date inside spreadsheet")
-    print("  2. Date from filename")
-    print("  3. File creation date")
-    print("  4. File order (filename)")
-    print("  5. Custom order")
+    print("  1. Current order (filename)")
+    print("  2. Date created")
+    print("  3. Custom order")
     choice = input("> ").strip()
     method = _ORDERING_MENU.get(choice, OrderingMethod.FILENAME)
 
@@ -186,8 +181,21 @@ def prompt_for_config(args: argparse.Namespace) -> RunConfig:
             print("Available labels detected:")
             for index, label in enumerate(candidates, start=1):
                 print(f"  {index}. {label}")
-        raw = input("Select one or more labels to graph (comma-separated):\n> ")
-        selectors = [Selector.from_input(token) for token in raw.split(",") if token.strip()]
+        raw = input("Select one or more labels to graph (name or number, comma-separated):\n> ")
+        tokens = [token.strip() for token in raw.split(",") if token.strip()]
+        # A token matching one of the numbers just printed is resolved to
+        # that label's actual text; anything else is taken as a literal
+        # label name or cell reference. Without this, typing the displayed
+        # number (a very natural thing to do, right below a menu that DOES
+        # take numbers) silently searches for a label named "1" or "2" and
+        # finds nothing.
+        resolved = [
+            candidates[int(token) - 1]
+            if token.isdigit() and candidates and 1 <= int(token) <= len(candidates)
+            else token
+            for token in tokens
+        ]
+        selectors = [Selector.from_input(token) for token in resolved]
 
     if args.order:
         ordering_method = OrderingMethod(args.order)
@@ -202,8 +210,7 @@ def prompt_for_config(args: argparse.Namespace) -> RunConfig:
         print("  1. Line Graph")
         print("  2. Scatter Plot")
         print("  3. Bar Graph")
-        print("  4. Automatic")
-        chart_type = _CHART_MENU.get(input("> ").strip(), ChartType.AUTO)
+        chart_type = _CHART_MENU.get(input("> ").strip(), ChartType.LINE)
 
     output_folder = Path(args.output_folder) if args.output_folder else Path("output")
 
@@ -224,13 +231,12 @@ def _print_summary(config: RunConfig, outputs: RunOutputs) -> None:
     print("=" * 40)
     print(f"{outputs.files_processed} files processed")
     print(f"{outputs.observation_count} data points extracted")
-    print(f"{outputs.warning_count} warnings")
-    print("Outputs saved to:")
-    print(f"  {outputs.chart_paths['html']}")
-    print(f"  {outputs.chart_paths['png']}")
-    print(f"  {outputs.report_paths['csv']}")
-    print(f"  {outputs.report_paths['summary']}")
-    print(f"  {outputs.report_paths['warnings']}")
+    print(f"{len(outputs.warnings)} warnings")
+    if outputs.warnings:
+        print("Warnings:")
+        for warning in outputs.warnings:
+            print(f"  {warning}")
+    print(f"Graph saved to: {outputs.chart_path}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -257,14 +263,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chart",
         choices=[chart.value for chart in ChartType],
-        help="Chart type; omit to be prompted, or pass 'auto' to let the tool decide",
+        help="Chart type; omit to be prompted",
     )
     parser.add_argument("--sheet", default=None, help="Worksheet name, if not the first sheet")
-    parser.add_argument(
-        "--open-graph",
-        action="store_true",
-        help="Open the generated interactive HTML graph in a browser when the run finishes",
-    )
     return parser
 
 
@@ -280,13 +281,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     outputs = run_pipeline(config)
     _print_summary(config, outputs)
-
-    if args.open_graph:
-        webbrowser.open(outputs.chart_paths["html"].resolve().as_uri())
-    elif sys.stdin.isatty():
-        answer = input("Open interactive graph now? [Y/N]\n> ").strip().lower()
-        if answer == "y":
-            webbrowser.open(outputs.chart_paths["html"].resolve().as_uri())
 
     return 0
 

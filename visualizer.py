@@ -2,25 +2,23 @@
 visualizer.py
 
 Turns an ExtractionResult (produced by spreadsheet_processor.extract_dataset)
-into charts. Per the "Automatically Produce Reusable Output" design note,
-every run saves both a static image (matplotlib, .png) and a self-contained
-interactive graph (Plotly, .html) that still works with no internet
-connection - the Plotly JavaScript library is embedded directly in the file
-rather than loaded from a CDN.
+into a single chart: a PNG image saved with matplotlib. This module works
+directly off the extracted observations - there is no separate table/
+dataframe step - since matplotlib only needs plain lists of x/y values to
+plot a line, scatter, or bar chart.
 
 This module only draws pictures. It does not read files or validate data -
 by the time an ExtractionResult reaches here, spreadsheet_processor.py has
 already decided what counts as a usable value.
 
-External dependencies: matplotlib (static PNG) and plotly (interactive
-HTML).
+External dependency: matplotlib.
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, List, Tuple
 
 import matplotlib
 
@@ -31,31 +29,8 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-import plotly.graph_objects as go
 
 from models import ChartType, ExtractionResult, RunConfig
-
-
-def choose_chart_type(result: ExtractionResult, requested: ChartType) -> ChartType:
-    """
-    Resolve ChartType.AUTO to a concrete chart type. A user-requested
-    concrete type is always honored unchanged.
-
-    Heuristic: this tool exists to show how values change across a set of
-    files, so a genuine trend (more than one point per series on average)
-    defaults to a line chart. A run that only produced one point per
-    series - e.g. comparing a single day's reading across several tickers -
-    reads better as a bar chart, since there is no line to draw between a
-    single point per series.
-    """
-    if requested != ChartType.AUTO:
-        return requested
-
-    if not result.observations:
-        return ChartType.LINE
-
-    points_per_series = len(result.observations) / max(len(result.series_summaries), 1)
-    return ChartType.LINE if points_per_series > 1 else ChartType.BAR
 
 
 def _sortable_key(order_key: Any) -> Tuple[int, Any]:
@@ -83,42 +58,26 @@ def _series_points(result: ExtractionResult, series_name: str) -> Tuple[List[Any
 
 def _shared_x_domain(result: ExtractionResult) -> List[Any]:
     """
-    The union of every order_key seen across all series, sorted once. Using
-    one shared x-axis (instead of each series drawing its own) is what
-    makes a missing value show up as a visible gap in that series' line
-    rather than silently compressing the x-axis for just that series.
+    The union of every order_key seen across all series, sorted once. Used
+    only for the bar chart, where every series needs to agree on the same
+    x-axis positions to be grouped correctly.
     """
     unique_keys = {obs.order_key for obs in result.observations}
     return sorted(unique_keys, key=_sortable_key)
 
 
-def create_charts(
-    result: ExtractionResult, config: RunConfig, run_id: str
-) -> Dict[str, Path]:
+def create_chart(result: ExtractionResult, config: RunConfig, run_id: str) -> Path:
     """
-    Render the extracted dataset as both a PNG (matplotlib) and a
-    self-contained interactive HTML file (Plotly), saved under
-    config.output_folder / "graphs". Returns the paths that were written.
+    Render the extracted dataset as a PNG chart under
+    config.output_folder / "graphs" and return the path that was written.
     """
     graphs_dir = config.output_folder / "graphs"
     graphs_dir.mkdir(parents=True, exist_ok=True)
-
-    chart_type = choose_chart_type(result, config.chart_type)
-    series_names = list(result.series_summaries.keys())
-    x_domain = _shared_x_domain(result)
-
     png_path = graphs_dir / f"{run_id}_chart.png"
-    html_path = graphs_dir / f"{run_id}_chart.html"
 
-    _render_matplotlib(result, series_names, chart_type, png_path)
-    _render_plotly(result, series_names, chart_type, x_domain, html_path)
+    chart_type = config.chart_type
+    series_names = result.series_names
 
-    return {"png": png_path, "html": html_path}
-
-
-def _render_matplotlib(
-    result: ExtractionResult, series_names: List[str], chart_type: ChartType, png_path: Path
-) -> None:
     figure, axes = plt.subplots(figsize=(10, 6))
 
     if chart_type == ChartType.BAR:
@@ -155,40 +114,4 @@ def _render_matplotlib(
     figure.savefig(png_path)
     plt.close(figure)
 
-
-def _render_plotly(
-    result: ExtractionResult,
-    series_names: List[str],
-    chart_type: ChartType,
-    x_domain: List[Any],
-    html_path: Path,
-) -> None:
-    figure = go.Figure()
-
-    for series_name in series_names:
-        x_values, y_values = _series_points(result, series_name)
-        if chart_type == ChartType.BAR:
-            figure.add_trace(go.Bar(x=x_values, y=y_values, name=series_name))
-        elif chart_type == ChartType.SCATTER:
-            figure.add_trace(
-                go.Scatter(x=x_values, y=y_values, mode="markers", name=series_name)
-            )
-        else:
-            # A line trace with connectgaps=False (the default) leaves a
-            # visible break at any x position this series has no point
-            # for, instead of drawing a straight line across the gap.
-            figure.add_trace(
-                go.Scatter(x=x_values, y=y_values, mode="lines+markers", name=series_name)
-            )
-
-    figure.update_layout(
-        title="Spreadsheet Visualizer - Extracted Series",
-        xaxis_title="Observation",
-        yaxis_title="Value",
-        template="plotly_white",
-    )
-
-    # include_plotlyjs=True embeds the full Plotly.js library inside this
-    # one HTML file so the chart still renders with no network access,
-    # per this tool's "processing/output is local" requirement.
-    figure.write_html(str(html_path), include_plotlyjs=True, full_html=True)
+    return png_path

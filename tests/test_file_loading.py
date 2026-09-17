@@ -20,7 +20,7 @@ class TestDiscoverFiles(unittest.TestCase):
         files = discover_files(TEST_DATA_DIR / "valid")
         self.assertEqual(
             [f.name for f in files],
-            ["weather_01.xlsx", "weather_02.xlsx", "weather_03.xlsx"],
+            [f"weather_{i:02d}.xlsx" for i in range(1, 11)],
         )
 
     def test_missing_folder_raises(self):

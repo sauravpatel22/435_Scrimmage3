@@ -3,8 +3,10 @@ spreadsheet_processor.py
 
 Core engine of the spreadsheet visualizer: finding .xlsx files in a folder,
 resolving a user's Selector (label or cell) to an actual value inside each
-workbook, determining a consistent x-axis ordering across files, extracting
-a combined dataset, and exporting that dataset + a warnings/summary report.
+workbook, determining a consistent x-axis ordering across files, and
+extracting a combined dataset (as an ExtractionResult) for visualizer.py to
+chart. Warnings collected along the way are handed back to the caller to
+print - this module writes no files of its own.
 
 This module is the direct implementation of the "Specific Design Notes"
 from the Scrimmage 2 plan:
@@ -12,24 +14,20 @@ from the Scrimmage 2 plan:
     drift in layout between runs)
   - a missing/invalid value in one file is recorded as a warning and the
     run continues, it never aborts the whole batch
-  - ordering can come from the filename, filesystem metadata, a date cell
-    inside the sheet, or an explicit user-supplied order
-  - every run writes a reusable CSV + report, not just an in-memory result
+  - ordering can come from the filename, filesystem metadata, or an
+    explicit user-supplied order
 
 External dependency: openpyxl, used to read .xlsx files without needing
-Excel installed. pandas is used only for the final CSV export, since it
-already knows how to serialize a table of rows correctly.
+Excel installed.
 """
 
 from __future__ import annotations
 
-import re
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import openpyxl
-import pandas as pd
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -48,14 +46,6 @@ from models import (
 # workbook that's currently open in the desktop app. It is not real data and
 # openpyxl cannot read it, so discovery must skip it explicitly.
 _EXCEL_LOCK_FILE_PREFIX = "~$"
-
-# Looks for an ISO-style date (2026-01-01, 2026_01_01, 20260101) anywhere in
-# a filename, used by the DATE_IN_FILENAME ordering method.
-_FILENAME_DATE_PATTERN = re.compile(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})")
-
-# A small set of header names that, if found as a label, point us at a
-# reasonable "date" column when ordering by DATE_IN_SHEET.
-_DATE_LABEL_CANDIDATES = ("DATE", "DATETIME", "TIMESTAMP")
 
 
 # ---------------------------------------------------------------------------
@@ -223,39 +213,14 @@ def normalize_numeric_value(raw: Any) -> Tuple[Optional[float], Optional[str]]:
 # Ordering
 # ---------------------------------------------------------------------------
 
-def _extract_date_from_filename(path: Path) -> Optional[date]:
-    match = _FILENAME_DATE_PATTERN.search(path.stem)
-    if not match:
-        return None
-    year, month, day = (int(part) for part in match.groups())
-    try:
-        return date(year, month, day)
-    except ValueError:
-        return None
-
-
-def _find_date_in_sheet(worksheet: Worksheet) -> Optional[Any]:
-    """Look for a DATE/DATETIME/TIMESTAMP label and return its value cell's
-    contents, reusing the same label-search logic as regular selectors."""
-    for candidate in _DATE_LABEL_CANDIDATES:
-        match = _find_label_cell(worksheet, candidate)
-        if match is not None:
-            row, col = match
-            return worksheet.cell(row=row, column=col + 1).value
-    return None
-
-
-def determine_order_key(
-    path: Path,
-    worksheet: Optional[Worksheet],
-    config: RunConfig,
-) -> Tuple[Any, Optional[str]]:
+def determine_order_key(path: Path, config: RunConfig) -> Tuple[Any, Optional[str]]:
     """
     Compute the value used to position one file's observations on the
     x-axis / processing order, per `config.ordering_method`. Returns
     (order_key, warning_message); when a preferred ordering signal isn't
-    available, this falls back to the filename so the run can still
-    proceed, and reports the fallback as a warning rather than failing.
+    available (e.g. a file missing from a custom order), this falls back to
+    the filename so the run can still proceed, and reports the fallback as
+    a warning rather than failing.
     """
     method = config.ordering_method
 
@@ -284,25 +249,6 @@ def determine_order_key(
             "true file creation time is unavailable on this platform; "
             "used last metadata-change time instead",
         )
-
-    if method == OrderingMethod.DATE_IN_FILENAME:
-        parsed = _extract_date_from_filename(path)
-        if parsed is not None:
-            return parsed, None
-        return path.name, f"no date found in filename '{path.name}'; sorted by name instead"
-
-    if method == OrderingMethod.DATE_IN_SHEET:
-        if worksheet is None:
-            return path.name, "worksheet unavailable; sorted by name instead"
-        raw = _find_date_in_sheet(worksheet)
-        if raw is None:
-            return path.name, "no DATE label found in sheet; sorted by name instead"
-        if isinstance(raw, (datetime, date)):
-            return raw, None
-        # openpyxl may hand back a raw string/number for a date cell
-        # depending on how it was authored; keep it as-is so files at
-        # least sort consistently, but flag that it wasn't a real date.
-        return raw, f"DATE value '{raw!r}' is not a recognized date/time; sorted by raw value"
 
     raise AssertionError(f"unhandled OrderingMethod: {method}")  # pragma: no cover
 
@@ -349,7 +295,7 @@ def extract_dataset(config: RunConfig) -> ExtractionResult:
                 )
                 continue
 
-            order_key, order_warning = determine_order_key(path, worksheet, config)
+            order_key, order_warning = determine_order_key(path, config)
             if order_warning:
                 result.add_warning(RunWarning(source_file=path, message=order_warning))
 
@@ -398,69 +344,3 @@ def extract_dataset(config: RunConfig) -> ExtractionResult:
             workbook.close()
 
     return result
-
-
-# ---------------------------------------------------------------------------
-# Export
-# ---------------------------------------------------------------------------
-
-def to_dataframe(result: ExtractionResult) -> pd.DataFrame:
-    """Flatten the extracted observations into a tabular DataFrame, one row
-    per data point, suitable for CSV export or further analysis."""
-    rows = [
-        {
-            "source_file": obs.source_file.name,
-            "sheet": obs.sheet_name,
-            "series": obs.series_name,
-            "cell": obs.cell,
-            "order_key": obs.order_key,
-            "value": obs.value,
-        }
-        for obs in result.observations
-    ]
-    return pd.DataFrame(
-        rows, columns=["source_file", "sheet", "series", "cell", "order_key", "value"]
-    )
-
-
-def export_reports(
-    result: ExtractionResult, config: RunConfig, run_id: str
-) -> Dict[str, Path]:
-    """
-    Write the run's reusable artifacts to disk: the extracted dataset as
-    CSV, every warning as a plain-text log, and a human-readable summary.
-    Every filename is prefixed with `run_id` so repeated runs never
-    overwrite each other's output.
-    """
-    csv_dir = config.output_folder / "csv"
-    reports_dir = config.output_folder / "reports"
-    csv_dir.mkdir(parents=True, exist_ok=True)
-    reports_dir.mkdir(parents=True, exist_ok=True)
-
-    csv_path = csv_dir / f"{run_id}_extracted_data.csv"
-    to_dataframe(result).to_csv(csv_path, index=False)
-
-    warnings_path = reports_dir / f"{run_id}_warnings.txt"
-    with warnings_path.open("w", encoding="utf-8") as handle:
-        if result.warnings:
-            for warning in result.warnings:
-                handle.write(str(warning) + "\n")
-        else:
-            handle.write("No warnings.\n")
-
-    summary_path = reports_dir / f"{run_id}_run_summary.txt"
-    with summary_path.open("w", encoding="utf-8") as handle:
-        handle.write(f"Run ID: {run_id}\n")
-        handle.write(f"Input folder: {config.input_folder}\n")
-        handle.write(f"Ordering method: {config.ordering_method.value}\n")
-        handle.write(f"Chart type: {config.chart_type.value}\n")
-        handle.write(f"Total observations: {len(result.observations)}\n")
-        handle.write(f"Total warnings: {len(result.warnings)}\n\n")
-        handle.write("Per-series summary:\n")
-        for series_name, summary in result.series_summaries.items():
-            handle.write(
-                f"  {series_name}: found {summary.files_found}, "
-                f"missing {summary.files_missing}, invalid {summary.files_invalid}\n"
-            )
-
-    return {"csv": csv_path, "warnings": warnings_path, "summary": summary_path}

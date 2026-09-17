@@ -39,23 +39,19 @@ You'll be walked through a short set of prompts:
    and lists names it found (e.g. `TEMP`, `HUMIDITY`), as a hint. You are
    not limited to this list.
 3. **Select one or more labels to graph** - type the name(s) you want to
-   track, comma-separated (e.g. `TEMP, HUMIDITY`). You can also type an
-   exact cell reference instead of a name (e.g. `B2`) if you know exactly
-   where the value lives.
+   track, comma-separated (e.g. `TEMP, HUMIDITY`), or the number(s) shown
+   next to them in the detected list above (e.g. `1, 2`). You can also type
+   an exact cell reference instead of a name (e.g. `B2`) if you know
+   exactly where the value lives.
 4. **How should observations be ordered?** - choose how the files should be
    lined up along the x-axis:
-   - `1` Date inside the spreadsheet (looks for a DATE/DATETIME/TIMESTAMP
-     label in each file)
-   - `2` Date parsed from the filename (e.g. `weather_2026-01-15.xlsx`)
-   - `3` File creation date (from the filesystem)
-   - `4` File order (alphabetical by filename)
-   - `5` Custom order - you'll be shown a numbered list of the discovered
+   - `1` Current order (alphabetical by filename)
+   - `2` Date created (from the filesystem)
+   - `3` Custom order - you'll be shown a numbered list of the discovered
      files and asked to type the order you want as numbers, e.g. `3, 1, 4, 2`
-5. **Select graph type** - `1` Line, `2` Scatter, `3` Bar, or `4` Automatic
-   (the tool picks Line for trend data, Bar if there's only one point per
-   series).
-6. When it finishes, it prints a summary and asks whether to open the
-   interactive graph in your browser right away.
+5. **Select graph type** - `1` Line, `2` Scatter, or `3` Bar.
+6. When it finishes, it prints a summary - including any warnings from the
+   run - and tells you where the PNG chart was saved.
 
 ### Non-interactive mode (flags only, no prompts)
 
@@ -67,7 +63,7 @@ python3 main.py \
   --input-folder ./weather_data \
   --series TEMP HUMIDITY \
   --order filename \
-  --chart auto
+  --chart line
 ```
 
 Available flags:
@@ -75,19 +71,18 @@ Available flags:
 | Flag | Meaning |
 | --- | --- |
 | `--input-folder PATH` | Folder of `.xlsx` files to process |
-| `--output-folder PATH` | Where to write results (default: `output/`) |
+| `--output-folder PATH` | Where to write the graph (default: `output/`) |
 | `--series NAME [NAME ...]` | One or more labels or cell references to extract |
-| `--order {filename,file_creation_date,date_in_filename,date_in_sheet,custom}` | Ordering method |
+| `--order {filename,file_creation_date,custom}` | Ordering method |
 | `--custom-order NAME [NAME ...]` | Filenames in the exact order to use (required with `--order custom` in non-interactive mode) |
-| `--chart {line,scatter,bar,auto}` | Chart type |
+| `--chart {line,scatter,bar}` | Chart type |
 | `--sheet NAME` | Worksheet name, if it isn't the first/only sheet |
-| `--open-graph` | Automatically open the interactive HTML chart when done |
 
 ### Try it on the bundled sample data
 
 ```bash
 python3 main.py --input-folder test_data/valid --series TEMP HUMIDITY \
-    --order filename --chart auto
+    --order filename --chart line
 ```
 
 ## 4. What kind of spreadsheets this expects
@@ -108,16 +103,16 @@ python3 main.py --input-folder test_data/valid --series TEMP HUMIDITY \
 
 ## 5. What you get back
 
-Every run writes to a timestamped set of files under `output/` (or your
-`--output-folder`), so repeated runs never overwrite each other:
+The only output file is the graph, written under `output/graphs/` (or your
+`--output-folder`), timestamped so repeated runs never overwrite each other:
 
 | File | Contents |
 | --- | --- |
-| `output/graphs/<run-id>_chart.png` | Static image of the chart |
-| `output/graphs/<run-id>_chart.html` | Interactive chart - open it in any browser, no internet needed |
-| `output/csv/<run-id>_extracted_data.csv` | Every extracted data point: source file, sheet, series, cell, order, value |
-| `output/reports/<run-id>_run_summary.txt` | Per-series found/missing/invalid counts and run settings |
-| `output/reports/<run-id>_warnings.txt` | Every warning raised during the run (missing labels, invalid values, ordering fallbacks) |
+| `output/graphs/<run-id>_chart.png` | The chart, as a static image |
+
+Everything else - files processed, data points extracted, and any warnings
+(missing labels, invalid values, ordering fallbacks) - is printed to the
+console when the run finishes. Nothing else is written to disk.
 
 ## 6. Troubleshooting
 
@@ -126,10 +121,10 @@ Every run writes to a timestamped set of files under `output/` (or your
 - **A series shows 0/N files found** - the label text must match exactly
   (case-insensitive, extra spaces are ignored). Check the "Available labels
   detected" list, or open one file to confirm the exact spelling.
-- **Ordering by date looks wrong** - "date in filename" expects an
-  `YYYY-MM-DD`-style date somewhere in the filename; "date in sheet" looks
-  for a `DATE`, `DATETIME`, or `TIMESTAMP` label. If neither applies, use
-  `--order filename` or `--order custom`.
+- **Ordering by "date created" looks wrong** - this uses the file's
+  filesystem creation time, which changes if a file is copied or
+  re-downloaded. If that isn't reliable for your files, use
+  `--order filename` or `--order custom` instead.
 - **Want to rerun tests to confirm everything still works?**
   ```bash
   python3 -m unittest discover -s tests -t . -v

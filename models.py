@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 # Matches a standard Excel cell reference such as "A1", "c9", or "AA123".
 # Used to tell "the user typed a cell address" apart from "the user typed
@@ -46,26 +46,22 @@ class OrderingMethod(Enum):
     requirement.
     """
 
-    FILENAME = "filename"                # sort by filename text
+    FILENAME = "filename"                      # current order: sort by filename text
     FILE_CREATION_DATE = "file_creation_date"  # sort by filesystem metadata
-    DATE_IN_FILENAME = "date_in_filename"      # parse a date out of the filename
-    DATE_IN_SHEET = "date_in_sheet"            # read a date cell from inside each file
     CUSTOM = "custom"                          # user supplies an explicit order
 
 
 class ChartType(Enum):
-    """Visualization requested by the user, or AUTO to let the tool decide."""
+    """Visualization type requested by the user."""
 
     LINE = "line"
     SCATTER = "scatter"
     BAR = "bar"
-    AUTO = "auto"
 
 
 class WarningLevel(Enum):
     """Severity of a RunWarning, used when printing the run summary."""
 
-    INFO = "info"
     WARNING = "warning"
     ERROR = "error"
 
@@ -111,10 +107,6 @@ class Selector:
         )
         return Selector(raw=text, type=selector_type, series_name=text)
 
-    @property
-    def is_cell_reference(self) -> bool:
-        return self.type == SelectorType.CELL
-
 
 @dataclass
 class RunConfig:
@@ -131,7 +123,7 @@ class RunConfig:
     ordering_method: OrderingMethod
     sheet_name: Optional[str] = None       # None = use each file's first/only sheet
     custom_order: Optional[List[str]] = None  # filenames in user-specified order
-    chart_type: ChartType = ChartType.AUTO
+    chart_type: ChartType = ChartType.LINE
 
     def __post_init__(self) -> None:
         if not self.selectors:
@@ -178,64 +170,39 @@ class RunWarning:
     level: WarningLevel = WarningLevel.WARNING
 
     def __str__(self) -> str:
-        # Human-readable form used when writing warnings.txt / printing
-        # the run summary, e.g. "weather_2026-02-14.xlsx -> HUMIDITY: missing"
+        # Human-readable form printed to the console,
+        # e.g. "weather_2026-02-14.xlsx -> HUMIDITY: missing"
         location = self.source_file.name if self.source_file else "run"
         subject = f" -> {self.series_name}" if self.series_name else ""
         return f"{location}{subject}: {self.message}"
 
 
 @dataclass
-class SeriesSummary:
-    """Per-series counts shown in the validation summary, e.g. the pptx's
-    "TEMP found in 120 / 120 files" line."""
-
-    series_name: str
-    files_found: int = 0
-    files_missing: int = 0
-    files_invalid: int = 0
-
-    @property
-    def files_considered(self) -> int:
-        return self.files_found + self.files_missing + self.files_invalid
-
-
-@dataclass
 class ExtractionResult:
     """
     The aggregate output of processing an entire folder: every successful
-    Observation, every RunWarning raised along the way, and a per-series
-    summary. spreadsheet_processor.py builds this; visualizer.py and
-    main.py's reporting step both read from it.
+    Observation, every RunWarning raised along the way, and the list of
+    series names seen (via either an observation or a warning), in first-
+    seen order for a stable chart legend. spreadsheet_processor.py builds
+    this; visualizer.py reads from it directly.
     """
 
     observations: List[Observation] = field(default_factory=list)
     warnings: List[RunWarning] = field(default_factory=list)
-    series_summaries: Dict[str, SeriesSummary] = field(default_factory=dict)
+    series_names: List[str] = field(default_factory=list)
 
     def add_observation(self, observation: Observation) -> None:
         self.observations.append(observation)
-        summary = self.series_summaries.setdefault(
-            observation.series_name, SeriesSummary(series_name=observation.series_name)
-        )
-        summary.files_found += 1
+        self._register_series(observation.series_name)
 
     def add_warning(self, warning: RunWarning) -> None:
         self.warnings.append(warning)
+        if warning.series_name is not None:
+            self._register_series(warning.series_name)
 
-        # Only bump the missing/invalid counters when the warning is tied
-        # to a specific series; run-level warnings (e.g. "file could not
-        # be opened") don't count against any one series' totals.
-        if warning.series_name is None:
-            return
-
-        summary = self.series_summaries.setdefault(
-            warning.series_name, SeriesSummary(series_name=warning.series_name)
-        )
-        if warning.level == WarningLevel.ERROR:
-            summary.files_invalid += 1
-        else:
-            summary.files_missing += 1
+    def _register_series(self, series_name: str) -> None:
+        if series_name not in self.series_names:
+            self.series_names.append(series_name)
 
     def observations_for(self, series_name: str) -> List[Observation]:
         """Convenience accessor used by visualizer.py to pull one series'

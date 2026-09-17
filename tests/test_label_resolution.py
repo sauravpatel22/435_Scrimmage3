@@ -24,7 +24,6 @@ class TestSelectorFromInput(unittest.TestCase):
     def test_plain_word_is_treated_as_a_label(self):
         selector = Selector.from_input("TEMP")
         self.assertEqual(selector.type, SelectorType.LABEL)
-        self.assertFalse(selector.is_cell_reference)
 
     def test_dollar_ticker_is_treated_as_a_label(self):
         selector = Selector.from_input("$AAPL")
