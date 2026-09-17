@@ -22,11 +22,11 @@ a CSV of the extracted data, and a warnings/summary report.
 ```text
 scrimmage3/
 ├── README.md                  This file
-├── main.py                    Entry point; user input/output and workflow orchestration (empty, not yet implemented)
-├── spreadsheet_processor.py   Discovery, label/cell resolution, ordering, extraction, validation (empty, not yet implemented)
-├── visualizer.py              Chart generation - line/scatter/bar, PNG + interactive HTML (empty, not yet implemented)
-├── models.py                  Shared data models: selections, run config, observations, warnings (empty, not yet implemented)
-├── requirements.txt           Python dependencies (pandas, numpy, matplotlib, etc.) (empty, not yet filled in)
+├── main.py                    Entry point; CLI prompts/flags and workflow orchestration (implemented)
+├── spreadsheet_processor.py   Discovery, label/cell resolution, ordering, extraction, validation, CSV/report export (implemented)
+├── visualizer.py              Chart generation - line/scatter/bar/auto, PNG + interactive HTML (implemented)
+├── models.py                  Shared data models: selectors, run config, observations, warnings (implemented; stdlib only, no external dependencies)
+├── requirements.txt           Python dependencies: openpyxl, pandas, matplotlib, plotly
 │
 ├── input/
 │   └── user_files/            Where a user drops their own .xlsx files to analyze (empty, gitignored contents)
@@ -43,9 +43,11 @@ scrimmage3/
 │   ├── invalid_data/          Files with non-numeric or blank measurement cells
 │   └── mixed_structure/       Files with reordered rows or extra columns
 │
-└── tests/                     Unit tests (not yet implemented)
-    ├── test_file_loading.py
-    ├── test_label_resolution.py
-    ├── test_extraction.py
-    └── test_validation.py
+└── tests/                     Unit tests (implemented, 46 tests, run against test_data/ fixtures)
+    ├── __init__.py             Puts the project root on sys.path so `import models` etc. work under discovery
+    ├── test_file_loading.py    discover_files, load_workbook_safe, select_worksheet
+    ├── test_label_resolution.py  Selector.from_input, resolve_selector (incl. shifted labels, duplicates)
+    ├── test_extraction.py      extract_dataset/to_dataframe/export_reports against every fixture folder
+    └── test_validation.py      normalize_numeric_value, RunConfig/Selector validation
 ```
+
