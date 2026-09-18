@@ -1,288 +1,291 @@
 """
-main.py
+main.py - the command line front end.
 
-Command-line entry point that ties the other modules together into the
-guided workflow described in the Scrimmage 2 plan and mocked up in
-scrimmage2_workflow.pptx: point at a folder of .xlsx files, pick one or
-more series to track, pick how to order observations, extract + validate
-the data, pick a chart type, and write the graph to disk. The only output
-file is a single PNG chart; any warnings from the run are printed to the
-console instead of being written to disk.
-
-This module is split into two layers on purpose:
-  - run_pipeline(config): pure orchestration, no user interaction. Given a
-    finished RunConfig, it calls spreadsheet_processor and visualizer and
-    returns the results. This is what tests should call directly.
-  - the interactive functions (prompt_for_config, main): gather a
-    RunConfig from the terminal (or from argparse flags, for
-    non-interactive/scripted use) and then call run_pipeline.
-
-No new external dependency is introduced here beyond what
-spreadsheet_processor.py and visualizer.py already require.
+Anything passed as a flag is not asked about, so the same code backs both the
+guided walk-through and a scripted run. run() never prints or prompts, so
+tests drive it directly.
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
-from dataclasses import dataclass
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
-import openpyxl
+import chart
+import sheets
 
-from models import ChartType, OrderingMethod, RunConfig, Selector
-from spreadsheet_processor import discover_files, extract_dataset
-from visualizer import create_chart
-
-_ORDERING_MENU = {
-    "1": OrderingMethod.FILENAME,
-    "2": OrderingMethod.FILE_CREATION_DATE,
-    "3": OrderingMethod.CUSTOM,
+_ORDER_MENU = {
+    "1": "filename",
+    "2": "date_in_filename",
+    "3": "date_in_sheet",
+    "4": "custom",
 }
 
-_CHART_MENU = {
-    "1": ChartType.LINE,
-    "2": ChartType.SCATTER,
-    "3": ChartType.BAR,
+_ORDER_HELP = {
+    "filename": "Current order (alphabetical by filename)",
+    "date_in_filename": "Date in the filename, e.g. weather_2026-01-15.xlsx",
+    "date_in_sheet": "Date inside the sheet (a DATE/DATETIME/TIMESTAMP label)",
+    "custom": "An order you type yourself",
 }
 
+_CHART_MENU = {"1": "line", "2": "scatter", "3": "bar"}
 
-@dataclass
-class RunOutputs:
-    """Everything a completed run produced, gathered in one place so the
-    interactive summary and any calling test can inspect it uniformly."""
-
-    run_id: str
-    files_processed: int
-    observation_count: int
-    warnings: List[str]
-    chart_path: Path
+_WARNINGS_SHOWN = 12   # console stays readable on a 500-file run
 
 
-# ---------------------------------------------------------------------------
-# Non-interactive orchestration (what tests should call)
-# ---------------------------------------------------------------------------
-
-def run_pipeline(config: RunConfig) -> RunOutputs:
-    """
-    Execute one full run for an already-built RunConfig: extract data and
-    generate the chart. Contains no input()/print() calls so it can be
-    exercised directly by tests or by other tools, and reused unchanged
-    whether config was built interactively or from CLI flags. Warnings are
-    returned as plain strings for the caller to print or otherwise handle,
-    rather than being written to a file here.
-    """
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    result = extract_dataset(config)
-    chart_path = create_chart(result, config, run_id)
-
-    files_processed = len({obs.source_file for obs in result.observations})
-
-    return RunOutputs(
-        run_id=run_id,
-        files_processed=files_processed,
-        observation_count=len(result.observations),
-        warnings=[str(warning) for warning in result.warnings],
-        chart_path=chart_path,
+def run(args) -> tuple[sheets.Result, list, Optional[Path]]:
+    """Extract, draw, and return (result, selections used, chart path)."""
+    result, selections = sheets.extract(
+        folder=Path(args.input_folder),
+        raw_selections=args.series,
+        ordering=args.order,
+        custom_order=args.custom_order,
+        sheet_name=args.sheet,
+        recursive=args.recursive,
     )
 
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = Path(args.output_folder) / "graphs" / f"{run_id}_chart.png"
+    drawn = chart.draw(
+        result,
+        path,
+        kind=args.chart,
+        title=args.title or "Spreadsheet Visualizer",
+        xlabel=args.xlabel or _ORDER_HELP.get(args.order, "Observation"),
+        ylabel=args.ylabel or "Value",
+        right_axis=args.right_axis or (),
+    )
+    return result, selections, drawn
 
-# ---------------------------------------------------------------------------
-# Interactive prompts
-# ---------------------------------------------------------------------------
 
-def _detect_candidate_labels(input_folder: Path, sample_size: int = 5) -> List[str]:
-    """
-    Best-effort peek at the first few files to suggest labels the user
-    might want to select, matching the "Available labels detected" step
-    of the sample workflow. This is only a convenience prompt - it never
-    blocks the user from typing a label that wasn't detected, since a
-    label might legitimately appear only in some files.
-    """
-    labels: List[str] = []
-    seen = set()
-
-    for path in discover_files(input_folder)[:sample_size]:
+def _ask(prompt: str, parse):
+    """Keep asking until parse() accepts the answer. Ctrl-C/EOF still quits."""
+    while True:
         try:
-            workbook = openpyxl.load_workbook(path, data_only=True, read_only=True)
-        except Exception:  # noqa: BLE001 - a preview failure is not fatal
-            continue
-        try:
-            worksheet = workbook.worksheets[0]
-            for row in worksheet.iter_rows(max_col=1):
-                for cell in row:
-                    value = cell.value
-                    if isinstance(value, str) and value.strip() and value.strip().casefold() not in (
-                        "property",
-                        "label",
-                        "name",
-                    ):
-                        normalized = value.strip()
-                        if normalized.casefold() not in seen:
-                            seen.add(normalized.casefold())
-                            labels.append(normalized)
-        finally:
-            workbook.close()
-
-    return labels
+            return parse(input(prompt).strip())
+        except (ValueError, IndexError, KeyError) as exc:
+            print(f"  {exc}")
+        except EOFError:
+            raise SystemExit(1)
 
 
-def _prompt_ordering(files: List[Path]) -> tuple[OrderingMethod, Optional[List[str]]]:
-    print("How should observations be ordered?")
-    print("  1. Current order (filename)")
-    print("  2. Date created")
-    print("  3. Custom order")
-    choice = input("> ").strip()
-    method = _ORDERING_MENU.get(choice, OrderingMethod.FILENAME)
+def as_folder(text: str) -> Path:
+    """
+    Turn typed or pasted text into a path. Dragging a folder into a terminal
+    or copying its path from Finder brings quotes or backslash-escaped spaces
+    with it; the literal text is tried first so a name really containing them
+    still works.
+    """
+    literal = Path(text.strip()).expanduser()
+    if literal.is_dir():
+        return literal
 
-    if method != OrderingMethod.CUSTOM:
-        return method, None
+    cleaned = text.strip()
+    for quote in ("'", '"'):
+        if len(cleaned) > 1 and cleaned.startswith(quote) and cleaned.endswith(quote):
+            cleaned = cleaned[1:-1]
+    cleaned = cleaned.replace("\\ ", " ").strip()
+    candidate = Path(cleaned).expanduser()
+    return candidate if candidate.is_dir() else literal
 
-    # Matches the numbered-selection demo in the workflow slides: list
-    # every discovered file with a number, then let the user type the
-    # desired order back as a comma-separated list of those numbers.
-    print("Detected files:")
+
+def _ask_folder(args) -> Path:
+    if args.input_folder:
+        return as_folder(str(args.input_folder))
+
+    def parse(text):
+        if not text:
+            raise ValueError("Please type a folder path.")
+        folder = as_folder(text)
+        if not folder.is_dir():
+            raise ValueError(f"No such folder: {folder}")
+        if not sheets.find_files(folder, recursive=args.recursive):
+            raise ValueError(f"No .xlsx files in {folder}")
+        return folder
+
+    return _ask("Folder containing the Excel files (full path is fine):\n> ", parse)
+
+
+def _ask_series(files, sheet_name) -> list[str]:
+    rows, headers = sheets.suggest_labels(files, sheet_name)
+    if rows:
+        print("\nLabels found:")
+        for index, label in enumerate(rows, start=1):
+            print(f"  {index}. {label}")
+    if headers:
+        print("Column headers found: " + ", ".join(headers))
+        print("  (for a grid, combine them: Bob:Exam, or Bob:* for every column)")
+
+    def parse(text):
+        if not text:
+            raise ValueError("Type at least one name, number, or cell.")
+        chosen = []
+        for token in (t.strip() for t in text.split(",")):
+            if not token:
+                continue
+            # A bare number means the one printed above.
+            if token.isdigit() and rows and 1 <= int(token) <= len(rows):
+                chosen.append(rows[int(token) - 1])
+            else:
+                chosen.append(token)
+        if not chosen:
+            raise ValueError("Type at least one name, number, or cell.")
+        return chosen
+
+    print("\nWhat do you want to graph?")
+    print("  a name (TEMP), a number from the list, a cell (B2),")
+    print("  a row and column (Bob:Exam), or several separated by commas")
+    return _ask("> ", parse)
+
+
+def custom_order_parser(files):
+    """Read "3, 1, 2" against a numbered file list, rejecting anything else."""
+    def parse(text):
+        numbers: list[int] = []
+        for token in (t.strip() for t in text.split(",")):
+            if not token:
+                continue
+            if not token.isdigit():
+                raise ValueError(f"'{token}' is not a number.")
+            number = int(token)
+            if not 1 <= number <= len(files):
+                raise ValueError(f"{number} is not between 1 and {len(files)}.")
+            if number in numbers:
+                raise ValueError(f"{number} is listed twice.")
+            numbers.append(number)
+        if not numbers:
+            raise ValueError("Type at least one number.")
+        return [files[n - 1].name for n in numbers]
+
+    return parse
+
+
+def _ask_order(files) -> tuple[str, Optional[list[str]]]:
+    print("\nHow should the files be ordered along the x-axis?")
+    for key, name in _ORDER_MENU.items():
+        print(f"  {key}. {_ORDER_HELP[name]}")
+
+    ordering = _ask("> ", lambda text: _ORDER_MENU[text or "1"])
+    if ordering != "custom":
+        return ordering, None
+
+    print("\nFiles found:")
     for index, path in enumerate(files, start=1):
         print(f"  {index}. {path.name}")
-    order_text = input("Enter desired order as numbers, e.g. 3, 1, 4, 2\n> ")
-    indices = [int(token.strip()) for token in order_text.split(",") if token.strip()]
-    custom_order = [files[i - 1].name for i in indices]
-    return method, custom_order
+
+    order = _ask("Type the order you want, e.g. 3, 1, 2\n> ", custom_order_parser(files))
+    missing = len(files) - len(order)
+    if missing:
+        print(f"  ({missing} file(s) you didn't list will go last)")
+    return "custom", order
 
 
-def prompt_for_config(args: argparse.Namespace) -> RunConfig:
-    """
-    Build a RunConfig by combining any CLI flags already supplied in
-    `args` with interactive input() prompts for whatever is still missing.
-    A fully-flagged invocation (all of --input-folder, --series, --order)
-    runs with no prompts at all, which is what lets this same function
-    back both the guided interactive flow and scripted/CI usage.
-    """
-    input_folder = Path(args.input_folder) if args.input_folder else None
-    if input_folder is None:
-        input_folder = Path(input("Enter folder containing Excel files:\n> ").strip())
+def _ask_chart() -> str:
+    print("\nChart type:")
+    print("  1. Line    2. Scatter    3. Bar")
+    return _ask("> ", lambda text: _CHART_MENU[text or "1"])
 
-    print("Scanning folder...")
-    files = discover_files(input_folder)
-    print(f"  {len(files)} Excel files found")
 
+def fill_in(args) -> argparse.Namespace:
+    """Ask for whatever the flags did not already answer."""
+    args.input_folder = _ask_folder(args)
+    files = sheets.find_files(Path(args.input_folder), recursive=args.recursive)
     if not files:
-        print(f"No .xlsx files found in {input_folder}.")
-        sys.exit(1)
+        print(f"No .xlsx files found in {args.input_folder}.")
+        raise SystemExit(1)
+    print(f"{len(files)} Excel file(s) found.")
 
-    if args.series:
-        selectors = [Selector.from_input(token) for token in args.series]
-    else:
-        candidates = _detect_candidate_labels(input_folder)
-        if candidates:
-            print("Available labels detected:")
-            for index, label in enumerate(candidates, start=1):
-                print(f"  {index}. {label}")
-        raw = input("Select one or more labels to graph (name or number, comma-separated):\n> ")
-        tokens = [token.strip() for token in raw.split(",") if token.strip()]
-        # A token matching one of the numbers just printed is resolved to
-        # that label's actual text; anything else is taken as a literal
-        # label name or cell reference. Without this, typing the displayed
-        # number (a very natural thing to do, right below a menu that DOES
-        # take numbers) silently searches for a label named "1" or "2" and
-        # finds nothing.
-        resolved = [
-            candidates[int(token) - 1]
-            if token.isdigit() and candidates and 1 <= int(token) <= len(candidates)
-            else token
-            for token in tokens
-        ]
-        selectors = [Selector.from_input(token) for token in resolved]
+    if not args.series:
+        args.series = _ask_series(files, args.sheet)
+    if not args.order:
+        args.order, custom = _ask_order(files)
+        args.custom_order = args.custom_order or custom
+    if not args.chart:
+        args.chart = _ask_chart()
 
-    if args.order:
-        ordering_method = OrderingMethod(args.order)
-        custom_order = args.custom_order
-    else:
-        ordering_method, custom_order = _prompt_ordering(files)
+    if args.order == "custom" and not args.custom_order:
+        print("--order custom needs --custom-order too.")
+        raise SystemExit(1)
+    return args
 
-    if args.chart:
-        chart_type = ChartType(args.chart)
-    else:
-        print("Select graph type:")
-        print("  1. Line Graph")
-        print("  2. Scatter Plot")
-        print("  3. Bar Graph")
-        chart_type = _CHART_MENU.get(input("> ").strip(), ChartType.LINE)
 
-    output_folder = Path(args.output_folder) if args.output_folder else Path("output")
-
-    return RunConfig(
-        input_folder=input_folder,
-        output_folder=output_folder,
-        selectors=selectors,
-        ordering_method=ordering_method,
-        custom_order=custom_order,
-        chart_type=chart_type,
-        sheet_name=args.sheet,
+def report(result, selections, drawn) -> None:
+    print("\n" + "=" * 46)
+    if selections:
+        print("Graphing: " + ", ".join(f"{s.name} [{s.describe()}]" for s in selections[:6]))
+        if len(selections) > 6:
+            print(f"  ... and {len(selections) - 6} more series")
+    print(
+        f"{result.files_scanned} file(s) read, "
+        f"{result.files_with_data} with data, "
+        f"{result.files_failed} unreadable"
     )
+    print(f"{len(result.points)} data point(s) across {len(result.series_names)} series")
+
+    for note in result.notes:
+        print(f"  note: {note}")
+
+    if result.warnings:
+        print(f"\n{len(result.warnings)} warning(s):")
+        for message in result.warnings[:_WARNINGS_SHOWN]:
+            print(f"  {message}")
+        hidden = len(result.warnings) - _WARNINGS_SHOWN
+        if hidden > 0:
+            # Grouped, so a folder with one repeated problem is one line.
+            kinds = Counter(m.split(": ", 1)[-1] for m in result.warnings[_WARNINGS_SHOWN:])
+            print(f"  ... and {hidden} more:")
+            for message, count in kinds.most_common(5):
+                print(f"    {count} x {message}")
+
+    if drawn:
+        print(f"\nGraph saved to: {drawn}")
+    else:
+        print("\nNo data was extracted, so no graph was drawn.")
+        print("Check the spelling of what you asked for, or try a different label.")
 
 
-def _print_summary(config: RunConfig, outputs: RunOutputs) -> None:
-    print("=" * 40)
-    print("             COMPLETE")
-    print("=" * 40)
-    print(f"{outputs.files_processed} files processed")
-    print(f"{outputs.observation_count} data points extracted")
-    print(f"{len(outputs.warnings)} warnings")
-    if outputs.warnings:
-        print("Warnings:")
-        for warning in outputs.warnings:
-            print(f"  {warning}")
-    print(f"Graph saved to: {outputs.chart_path}")
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Visualize a property across a folder of similarly structured .xlsx files."
+        description="Graph values across a folder of similarly structured .xlsx files."
     )
-    parser.add_argument("--input-folder", help="Folder containing the .xlsx files to process")
-    parser.add_argument("--output-folder", default=None, help="Where to write generated output")
+    parser.add_argument("--input-folder", help="Folder holding the .xlsx files")
+    parser.add_argument("--output-folder", default="output", help="Where the graph goes")
     parser.add_argument(
-        "--series",
-        nargs="+",
-        help="One or more labels/cell references to extract, e.g. --series TEMP HUMIDITY",
+        "--series", nargs="+",
+        help="What to graph: TEMP, B2, Bob:Exam, Bob:*, cell:T5, TEMP=Outside",
     )
+    parser.add_argument("--order", choices=sheets.ORDERINGS, help="X-axis order")
+    parser.add_argument("--custom-order", nargs="+", help="Filenames, in the order you want")
+    parser.add_argument("--chart", choices=chart.CHART_TYPES, help="Chart type")
+    parser.add_argument("--sheet", help="Worksheet name, if not the first one")
+    parser.add_argument("--recursive", action="store_true", help="Include subfolders")
+    parser.add_argument("--title", help="Chart title")
+    parser.add_argument("--xlabel", help="X-axis label")
+    parser.add_argument("--ylabel", help="Y-axis label")
     parser.add_argument(
-        "--order",
-        choices=[method.value for method in OrderingMethod],
-        help="Ordering method for the x-axis",
+        "--right-axis", nargs="+", metavar="SERIES",
+        help="Series to put on a second y-axis (for very different ranges)",
     )
-    parser.add_argument(
-        "--custom-order",
-        nargs="+",
-        help="Filenames in the desired order (required when --order custom is used non-interactively)",
-    )
-    parser.add_argument(
-        "--chart",
-        choices=[chart.value for chart in ChartType],
-        help="Chart type; omit to be prompted",
-    )
-    parser.add_argument("--sheet", default=None, help="Worksheet name, if not the first sheet")
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
     try:
-        config = prompt_for_config(args)
-    except (ValueError, FileNotFoundError) as exc:
+        args = fill_in(args)
+    except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}")
         return 1
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 1
 
-    outputs = run_pipeline(config)
-    _print_summary(config, outputs)
-
-    return 0
+    result, selections, drawn = run(args)
+    report(result, selections, drawn)
+    return 0 if result.points else 1
 
 
 if __name__ == "__main__":

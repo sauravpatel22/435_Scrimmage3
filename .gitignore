@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+output/
+!output/**/.gitkeep
+input/user_files/*
+!input/user_files/.gitkeep
+.DS_Store
